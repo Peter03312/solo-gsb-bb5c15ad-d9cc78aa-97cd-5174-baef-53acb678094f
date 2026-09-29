@@ -31,6 +31,12 @@ const els = {
   chainDemo: $('#chain-demo'),
   chainResult: $('#chain-result'),
 
+  auditScenarios: $('#audit-scenarios'),
+  auditAdd: $('#audit-add'),
+  auditRun: $('#audit-run'),
+  auditDemo: $('#audit-demo'),
+  auditResult: $('#audit-result'),
+
   resetBtn: $('#reset-btn'),
   jarCount: $('#jar-count-num'),
   jarWrap: $('#jar-table-wrap'),
@@ -301,6 +307,7 @@ els.snapshotFile.addEventListener('change', async () => {
     els.storeResult.classList.add('hidden');
     els.sendResult.classList.add('hidden');
     els.chainResult.classList.add('hidden');
+    els.auditResult.classList.add('hidden');
     els.capResult.classList.add('hidden');
     els.scriptReadResult.classList.add('hidden');
     els.scriptWriteResult.classList.add('hidden');
@@ -865,6 +872,270 @@ els.chainDemo.addEventListener('click', () => {
   addChainStep(200, '', ['ui=ready; Path=/; Secure']);
 });
 
+/* ---------- 批量请求审计（同名 Cookie 歧义） ---------- */
+
+const AUDIT_METHOD_OPTIONS = ['GET', 'POST', 'HEAD', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'];
+const AUDIT_MAX_SCENARIOS = 20;
+
+/** 新增一个审计场景行（默认 GET + 顶层导航；参数与 /api/send 完全一致） */
+function addAuditScenario(sc = {}) {
+  const idx = els.auditScenarios.children.length + 1;
+  const row = document.createElement('div');
+  row.className = 'chain-step audit-scenario';
+  const methodOptions = AUDIT_METHOD_OPTIONS
+    .map((m) => `<option value="${m}"${m === (sc.method || 'GET') ? ' selected' : ''}>${m}</option>`)
+    .join('');
+  row.innerHTML = `
+    <div class="audit-step-head chain-step-head">
+      <span class="chain-step-no audit-no">场景 ${idx}</span>
+      <input class="audit-url" type="text" spellcheck="false" autocomplete="off"
+        placeholder="请求 URL（必填，http(s)），如 https://www.example.com/"
+        value="${escapeHtml(sc.url || '')}" />
+      <select class="audit-method" title="请求方法">${methodOptions}</select>
+      <label class="audit-nav" title="顶层导航（地址栏 / 链接跳转；子资源请取消勾选）">
+        <input class="audit-topnav" type="checkbox" ${sc.topLevelNav === false ? '' : 'checked'} /> 顶层导航
+      </label>
+      <label class="audit-nav" title="屏蔽第三方 Cookie（开启后必须填有效顶层页面 URL）">
+        <input class="audit-block3p" type="checkbox" ${sc.blockThirdParty ? 'checked' : ''} /> 屏蔽第三方
+      </label>
+      <button class="btn ghost tiny audit-del" type="button" title="删除该场景">✕</button>
+    </div>
+    <div class="audit-top-wrap">
+      <input class="audit-top-url" type="text" spellcheck="false" autocomplete="off"
+        placeholder="顶层页面 URL（可选；留空 = 与请求 URL 同站。开启屏蔽第三方时必填），如 https://other.org/"
+        value="${escapeHtml(sc.topUrl || '')}" />
+    </div>`;
+
+  row.querySelector('.audit-del').addEventListener('click', () => {
+    row.remove();
+    renumberAuditScenarios();
+  });
+  els.auditScenarios.appendChild(row);
+  return row;
+}
+
+function renumberAuditScenarios() {
+  [...els.auditScenarios.children].forEach((row, i) => {
+    row.querySelector('.audit-no').textContent = `场景 ${i + 1}`;
+  });
+  els.auditAdd.disabled = els.auditScenarios.children.length >= AUDIT_MAX_SCENARIOS;
+}
+
+/** 收集全部场景行；返回 { scenarios } 或 { error }（前端轻校验，服务端仍整批权威校验） */
+function collectAuditScenarios() {
+  const rows = [...els.auditScenarios.children];
+  if (!rows.length) return { error: '请至少添加一个请求场景' };
+  const scenarios = [];
+  for (const row of rows) {
+    const url = row.querySelector('.audit-url').value.trim();
+    const topUrl = row.querySelector('.audit-top-url').value.trim();
+    if (!url) return { error: `第 ${scenarios.length + 1} 个场景缺少请求 URL（必填）` };
+    const scenario = {
+      url,
+      method: row.querySelector('.audit-method').value,
+      topLevelNav: row.querySelector('.audit-topnav').checked,
+      blockThirdParty: row.querySelector('.audit-block3p').checked,
+    };
+    if (topUrl !== '') scenario.topUrl = topUrl;
+    scenarios.push(scenario);
+  }
+  if (scenarios.length > AUDIT_MAX_SCENARIOS) {
+    return { error: `场景数最多 ${AUDIT_MAX_SCENARIOS} 个（当前 ${scenarios.length} 个）` };
+  }
+  return { scenarios };
+}
+
+/* ---- 结果渲染 ---- */
+
+/** 同名冲突中的单条目行（值 / 域 / 路径 / 分区键；高亮同名值相异） */
+function auditConflictItemHtml(item, valuesDiffer) {
+  const scopeBadge = item.hostOnly
+    ? '<span class="badge host">host-only</span>'
+    : '<span class="badge domain">domain</span>';
+  const partBadge = item.partitioned
+    ? `<span class="badge part-on">Partitioned · ${escapeHtml(item.partitionKey)}</span>`
+    : '<span class="badge part-none">未分区</span>';
+  return `
+    <tr class="${valuesDiffer ? 'conflict-diff' : ''}">
+      <td class="dim">#${item.position}（#${item.index}）</td>
+      <td class="mono"><span class="cookie-name">${escapeHtml(item.name)}</span>=<span class="cookie-value">${escapeHtml(item.value)}</span></td>
+      <td>${scopeBadge}<div class="domain-val">${escapeHtml(item.domain)}</div></td>
+      <td class="mono">${escapeHtml(item.path)}</td>
+      <td class="part-cell">${partBadge}</td>
+    </tr>`;
+}
+
+function auditConflictHtml(group) {
+  const diffBadge = group.valuesDiffer
+    ? '<span class="tag evict">值相异</span>'
+    : '<span class="tag send">值相同</span>';
+  const valuesLine = group.valuesDiffer
+    ? group.distinctValues.map((v) => `<code>${escapeHtml(v)}</code>`).join(' / ')
+    : `<code>${escapeHtml(group.distinctValues[0])}</code>`;
+  return `
+    <div class="conflict-group ${group.valuesDiffer ? 'diff' : 'same'}">
+      <div class="group-title conflict-title">
+        ⚠️ 同名冲突：<span class="cookie-name">${escapeHtml(group.name)}</span>
+        ${diffBadge}
+        <span class="dim">${group.count} 条 · 同名值${group.valuesDiffer ? '相异' : '相同'}：${valuesLine}</span>
+      </div>
+      <table class="jar-table conflict-table">
+        <thead>
+          <tr><th>头内位置（创建#）</th><th>Cookie</th><th>域 / 作用域</th><th>Path</th><th>分区</th></tr>
+        </thead>
+        <tbody>${group.items.map((it) => auditConflictItemHtml(it, group.valuesDiffer)).join('')}</tbody>
+      </table>
+    </div>`;
+}
+
+function auditScenarioHtml(s) {
+  const headerVal = s.cookieHeader
+    ? escapeHtml(s.cookieHeader)
+    : '<span class="dim">（空：没有任何可发送的 cookie）</span>';
+  const siteBadge = s.sameSiteContext
+    ? '<span class="badge ss-same">同站</span>'
+    : '<span class="badge ss-cross">跨站</span>';
+  const blockBadge = s.blockThirdParty
+    ? '<span class="badge ss-cross">屏蔽第三方 Cookie：开</span>'
+    : '<span class="badge ss-same">屏蔽第三方 Cookie：关</span>';
+
+  const conflictsHtml = s.conflicts.length
+    ? `<div class="conflict-box">
+         <div class="banner delete"><span class="banner-title">⚠️ 检测到 ${s.conflicts.length} 组同名 Cookie 歧义</span>
+         仅统计至少两条「已发送」的同名条目；被排除项不计入冲突</div>
+         ${s.conflicts.map(auditConflictHtml).join('')}
+       </div>`
+    : '<div class="dim conflict-none">✅ 已发送条目中没有同名冲突（同名但被排除的项不计入）。</div>';
+
+  const sentHtml = s.sent.length
+    ? `<div class="group-title">📤 发送项（${s.sent.length}，已按 Path 长度降序 / 创建顺序升序排列）</div>
+       <div class="item-list">${s.sent.map(itemHtml).join('')}</div>`
+    : '<div class="group-title">📤 发送项<span class="count">（0）</span></div>';
+  const excludedHtml = s.excluded.length
+    ? `<div class="group-title">🚫 排除项（${s.excluded.length}，逐项排除原因）</div>
+       <div class="item-list">${s.excluded.map(itemHtml).join('')}</div>`
+    : '';
+
+  const conflictBadge = s.conflicts.length
+    ? `<span class="tag evict">${s.conflicts.length} 组冲突</span>`
+    : '<span class="tag send">无同名冲突</span>';
+
+  return `
+    <details class="chain-hop audit-hop" ${s.conflicts.length ? ' open' : ''}>
+      <summary class="chain-hop-summary">
+        <span class="badge ss-lax">场景 ${s.scenario}</span>
+        ${conflictBadge}
+        <code class="chain-hop-url">${escapeHtml(s.method)} ${escapeHtml(s.requestUrl)}</code>
+        ${siteBadge}
+        <span class="dim">发送 ${s.sentCount} · 排除 ${s.excludedCount}</span>
+      </summary>
+      <div class="chain-hop-body">
+        <div class="meta-line dim">
+          请求主机 <code>${escapeHtml(s.host)}</code> · 路径 <code>${escapeHtml(s.path)}</code>
+          · ${s.secureRequest ? 'https' : 'http'}
+          · 顶层页面 <code>${escapeHtml(s.topUrl)}</code>
+          · 请求站 <code>${escapeHtml(s.requestSite)}</code> vs 顶层站 <code>${escapeHtml(s.topSite)}</code>
+          · ${s.topLevelNav ? '顶层导航' : '非顶层导航'}
+          · 分区键 <code>${escapeHtml(s.partitionKey)}</code>
+          · ${s.blockThirdParty ? '屏蔽第三方 Cookie：开' : '屏蔽第三方 Cookie：关'}
+        </div>
+        <div class="header-block">
+          <div class="header-line ${s.cookieHeader ? '' : 'empty'}">
+            <span class="hname">Cookie:</span><span class="hval">${headerVal}</span>
+          </div>
+        </div>
+        ${conflictsHtml}
+        ${sentHtml}
+        ${excludedHtml}
+      </div>
+    </details>`;
+}
+
+function renderAuditResult(data) {
+  els.auditResult.classList.remove('hidden');
+  if (!data.ok) {
+    els.auditResult.innerHTML = `
+      <div class="banner bad">
+        <span class="banner-title">⛔ 整批审计未执行</span>${escapeHtml(data.error || '参数有误')}
+      </div>`;
+    return;
+  }
+  const summary = data.totalConflictCount > 0
+    ? `<div class="banner delete">
+         <span class="banner-title">⚠️ 审计完成：${data.scenarioCount} 个场景中 ${data.scenariosWithConflicts} 个存在同名冲突，共 ${data.totalConflictCount} 组</span>
+         冲突仅在单个请求头内判定（至少两条已发送的同名条目），被排除项不计入；审计纯只读，未刷新访问时间、未改动罐/容量、未推进时钟
+       </div>`
+    : `<div class="banner ok">
+         <span class="banner-title">✅ 审计完成：${data.scenarioCount} 个场景均无同名冲突</span>
+         审计纯只读——未刷新最近访问时间、未改动罐/容量、未推进演算时钟（基准时间 ${escapeHtml(data.clock ? data.clock.readable : '')}）
+       </div>`;
+  els.auditResult.innerHTML =
+    `${summary}<div class="chain-hops">${data.scenarios.map(auditScenarioHtml).join('')}</div>`;
+}
+
+els.auditAdd.addEventListener('click', () => {
+  if (els.auditScenarios.children.length >= AUDIT_MAX_SCENARIOS) return;
+  addAuditScenario();
+});
+
+els.auditRun.addEventListener('click', async () => {
+  const collected = collectAuditScenarios();
+  if (collected.error) {
+    renderAuditResult({ ok: false, error: collected.error });
+    return;
+  }
+  els.auditRun.disabled = true;
+  try {
+    const data = await postJSON('/api/audit-requests', { scenarios: collected.scenarios });
+    renderAuditResult(data);
+    // 纯只读：罐表格 / 容量 / 时钟均无需因审计而刷新
+  } catch (err) {
+    renderAuditResult({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    els.auditRun.disabled = false;
+  }
+});
+
+/**
+ * 示例：先按固定顺序写入若干会产生同名歧义的 Cookie（覆盖更新，幂等可重复点击），
+ * 再填入 3 个请求场景。写入会改动罐（这是示例数据准备，非审计本身）。
+ */
+els.auditDemo.addEventListener('click', async () => {
+  const demoCookies = [
+    // sid：host-only 于 www.example.com 与 Domain=example.com 并存（值相异）
+    { url: 'https://www.example.com/', setCookie: 'sid=host-only-value; Path=/; Secure' },
+    { url: 'https://example.com/', setCookie: 'sid=domain-value; Domain=example.com; Path=/; Secure' },
+    // theme：同站不同 Path 两条（值相同，演示「值相同」标记）
+    { url: 'https://www.example.com/app', setCookie: 'theme=dark; Path=/app; Secure' },
+    { url: 'https://www.example.com/app/v2', setCookie: 'theme=dark; Path=/app/v2; Secure' },
+    // pval：不同 Path 同名两条，场景 2 只命中其一（演示「被排除项不计入冲突」）
+    { url: 'https://www.example.com/', setCookie: 'pval=root; Path=/; Secure' },
+    { url: 'https://www.example.com/app', setCookie: 'pval=app; Path=/app; Secure' },
+  ];
+  els.auditDemo.disabled = true;
+  try {
+    for (const c of demoCookies) {
+      await postJSON('/api/store', c);
+    }
+    els.auditScenarios.innerHTML = '';
+    addAuditScenario({ url: 'https://www.example.com/app/v2/dashboard', method: 'GET' });
+    addAuditScenario({ url: 'https://www.example.com/app', method: 'GET' });
+    addAuditScenario({
+      url: 'https://www.example.com/',
+      topUrl: 'https://other-site.org/',
+      method: 'GET',
+      topLevelNav: false,
+    });
+    renumberAuditScenarios();
+    await refreshJar();
+    toast('已写入 6 条示例 Cookie 并填入 3 个审计场景，点击「执行批量审计」');
+  } catch (err) {
+    toast(err instanceof Error ? err.message : String(err));
+  } finally {
+    els.auditDemo.disabled = false;
+  }
+});
+
 /* ---------- 事件 ---------- */
 
 els.storeBtn.addEventListener('click', async () => {
@@ -939,6 +1210,7 @@ els.resetBtn.addEventListener('click', async () => {
     els.storeResult.classList.add('hidden');
     els.sendResult.classList.add('hidden');
     els.chainResult.classList.add('hidden');
+    els.auditResult.classList.add('hidden');
     els.capResult.classList.add('hidden');
     els.scriptReadResult.classList.add('hidden');
     els.scriptWriteResult.classList.add('hidden');
@@ -1202,4 +1474,6 @@ els.chainTopUrl.addEventListener('keydown', (e) => {
 /* 初始加载 */
 addChainStep(302, '', []);
 addChainStep(200, '', []);
+addAuditScenario({ url: '', method: 'GET' });
+renumberAuditScenarios();
 refreshJar().catch((err) => console.error(err));

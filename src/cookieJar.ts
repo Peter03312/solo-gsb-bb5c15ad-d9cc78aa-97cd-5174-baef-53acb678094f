@@ -56,6 +56,16 @@
  *     分区键匹配的 Partitioned 项不受此限，仍可发送；
  *   - 排序：Path 长度降序；相同长度按首次创建顺序（creation index）升序。
  *
+ *  批量请求审计（POST /api/audit-requests，纯只读）：
+ *   - 一次提交 1~20 个请求场景（请求 URL，可选顶层页面 URL / 方法 / 顶层导航 / 第三方屏蔽）；
+ *   - 按与 send() 完全相同的规则分别演算每个场景的 Cookie 头与逐项排除原因，
+ *     但不刷新任何条目的最近访问时间（touchAccess=false），不改动罐、容量，也不推进时钟；
+ *   - 在每个请求内部识别同名歧义：同一请求中至少两条「已发送」的同名条目构成冲突，
+ *     按 Cookie 头内次序列出各项的值、域、路径、分区键，并标记同名值是否相异；
+ *     被排除项不计入冲突，冲突不跨场景累计；
+ *   - 先对整批做完整预校验（结构 / URL / 方法 / 布尔字段 / 屏蔽第三方必须带有效顶层 URL），
+ *     任一场景参数无效即抛错，整批不执行、状态不变。
+ *
  *  document.cookie 脚本演算（页面 JS 视角，与网络接口并列、规则不同）：
  *   - 读取（readDocumentCookie / POST /api/script/read；入参：页面 URL、顶层页面 URL、第三方屏蔽开关）：
  *     按既有「过期 → 分区 → 第三方屏蔽 → Domain → Path → Secure」顺序筛选，
@@ -432,6 +442,97 @@ export interface SendResult {
   cookieHeader: string;
   sent: RequestItem[];
   excluded: RequestItem[];
+}
+
+/** 批量请求审计（POST /api/audit-requests）中的单个请求场景入参 */
+export interface AuditRequestInput {
+  /** 请求 URL（必填，http(s) 绝对地址） */
+  url: string;
+  /** 顶层页面 URL（可选；开启 blockThirdParty 时必填且须有效） */
+  topUrl?: string;
+  /** 请求方法（可选，大小写不敏感；缺省 GET） */
+  method?: string;
+  /** 是否顶层导航（可选，缺省 true） */
+  topLevelNav?: boolean;
+  /** 屏蔽第三方 Cookie（可选，缺省 false；为 true 时 topUrl 必填） */
+  blockThirdParty?: boolean;
+}
+
+/** 同名冲突中的单个条目（取自该请求的已发送列表，顺序即 Cookie 头内次序） */
+export interface CookieConflictItem {
+  /** 在本次 Cookie 头中的位置（从 1 开始） */
+  position: number;
+  /** 条目的首次创建序号 */
+  index: number;
+  /** 完整 name=value */
+  cookie: string;
+  name: string;
+  value: string;
+  domain: string;
+  hostOnly: boolean;
+  /** 展示用作用域：host-only / domain（含 *.domain） */
+  scope: string;
+  path: string;
+  /** 是否独立分区 cookie（CHIPS） */
+  partitioned: boolean;
+  /** 分区键；未分区为 null */
+  partitionKey: string | null;
+}
+
+/** 同一请求头中至少两条已发送的同名条目所构成的冲突 */
+export interface CookieNameConflict {
+  /** 重复出现的 cookie-name（大小写敏感的精确名称） */
+  name: string;
+  /** 头内该名称的条目数（≥2） */
+  count: number;
+  /** 同名条目的值是否相异（存在两个及以上不同值时为 true） */
+  valuesDiffer: boolean;
+  /** 该名称下出现过的全部不同值（按头内首次出现次序） */
+  distinctValues: string[];
+  /** 冲突条目，按 Cookie 头内次序排列 */
+  items: CookieConflictItem[];
+}
+
+/** 单个请求场景的审计结果：完整 send 演算结果 + 同名冲突清单 */
+export interface AuditScenarioResult {
+  /** 场景序号（从 1 开始，即提交数组中的位置） */
+  scenario: number;
+  requestUrl: string;
+  host: string;
+  path: string;
+  secureRequest: boolean;
+  /** 实际采用的顶层页面 URL（缺省时回显请求 URL） */
+  topUrl: string;
+  method: string;
+  topLevelNav: boolean;
+  requestSite: string;
+  topSite: string;
+  sameSiteContext: boolean;
+  blockThirdParty: boolean;
+  partitionKey: string;
+  cookieHeader: string;
+  sentCount: number;
+  excludedCount: number;
+  sent: RequestItem[];
+  excluded: RequestItem[];
+  /** 本场景检测到的同名冲突组数 */
+  conflictCount: number;
+  conflicts: CookieNameConflict[];
+}
+
+/** POST /api/audit-requests 的结果：纯只读，任何场景失败都不返回本结构 */
+export interface AuditRequestsResult {
+  ok: boolean;
+  error?: string;
+  /** 本次审计的场景总数（1~20） */
+  scenarioCount: number;
+  scenarios: AuditScenarioResult[];
+  /** 存在同名冲突的场景数 */
+  scenariosWithConflicts: number;
+  /** 全部场景冲突组数之和（冲突仅在单个请求头内判定，不跨场景累计） */
+  totalConflictCount: number;
+  /** 审计时刻的演算时钟快照（审计不推进时钟，仅回显以表明基准时间） */
+  clock: ClockView;
 }
 
 /** 重定向状态码：301/302/303/307/308（方法改写规则各有不同） */
@@ -1312,8 +1413,28 @@ export class CookieJar {
    * （缺省：顶层页 = 请求 URL、GET、顶层导航，即同站安全方法，全部 SameSite 模式放行）。
    * 请求分区键由顶层页面 URL（缺省取请求 URL）计算；Partitioned 项仅在分区键相同时发送。
    * 逐项给出 send / exclude 及原因；发送项按 Path 长度降序、首次创建顺序升序排列。
+   * 发送成功的条目刷新最近访问时间（容量淘汰 LRA 依据）。
    */
   send(requestUrl: string, options: SendOptions = {}, now: number = this.clockNow): SendResult {
+    // 网络请求演算：发送成功即「访问」，刷新最近访问时间
+    return this.computeSend(requestUrl, options, now, true);
+  }
+
+  /**
+   * 发送演算的统一内部实现：
+   *  - touchAccess=true（网络 send / 重定向链）：发送成功的条目刷新最近访问时间；
+   *  - touchAccess=false（批量请求审计 auditRequests）：纯只读演算，
+   *    与 document.cookie 读取一致——不刷新任何条目的最近访问时间，
+   *    也不改动罐内容、容量与演算时钟。
+   * 其余规则（过期 → 分区 → 第三方屏蔽 → Domain → Path → Secure → SameSite → 排序）
+   * 在两种模式下完全一致，保证审计所见即真实发送结果。
+   */
+  private computeSend(
+    requestUrl: string,
+    options: SendOptions,
+    now: number,
+    touchAccess: boolean,
+  ): SendResult {
     const urlInfo = hostFromUrl(requestUrl);
     if (!urlInfo) {
       return this.sendError(`请求 URL 非法或非 http(s)：${requestUrl}`, requestUrl);
@@ -1450,8 +1571,9 @@ export class CookieJar {
         partitionWay +
         thirdPartyWay +
         `；${ssVerdict.note}`;
-      // 发送成功即「访问」：刷新最近访问时间（容量淘汰 LRA 依据）
-      c.lastAccessedAt = now;
+      // 发送成功即「访问」：刷新最近访问时间（容量淘汰 LRA 依据）。
+      // 批量请求审计为纯只读（touchAccess=false），不刷新任何条目的访问时间。
+      if (touchAccess) c.lastAccessedAt = now;
       sent.push(base);
     }
 
@@ -1484,6 +1606,180 @@ export class CookieJar {
       sent,
       excluded,
     };
+  }
+
+  /**
+   * 批量请求审计（POST /api/audit-requests）：一次性提交 1~20 个请求场景，
+   * 按现有发送规则（与 send() 完全相同的过期/分区/第三方屏蔽/Domain/Path/Secure/
+   * SameSite 演算与排序）分别计算每个请求的 Cookie 头与逐项排除原因，并在每个请求
+   * 内部识别「同名条目在请求头中的歧义」：同一请求中**至少两条已发送**的同名条目
+   * 按头内次序列出（值、域、路径、分区键），并标记值是否相异。**被排除项不计入冲突。**
+   *
+   * 纯只读：审计使用 computeSend 的 touchAccess=false 模式——**不刷新最近访问时间**，
+   * 不改动罐内容、容量，也**不推进演算时钟**。
+   *
+   * 原子性：先对全部场景做完整预校验（结构由 server 层把关，语义在此完成：
+   * 请求 URL / 顶层 URL 必须是有效 http(s) 地址，方法为非空字符串，
+   * topLevelNav / blockThirdParty 必须是布尔值，开启 blockThirdParty 时必须提供
+   * 有效顶层页面 URL），任一场景参数无效即抛错，**整批不执行、状态不变**。
+   */
+  auditRequests(input: { scenarios: AuditRequestInput[] }): AuditRequestsResult {
+    // ---- 完整预校验：全部通过后才开始演算；任何异常都发生在罐被读取之外，状态不变 ----
+    if (!isObject(input) || !Array.isArray(input.scenarios)) {
+      throw new Error('批量请求审计：请求体必须是 { "scenarios": [...] } 对象；整批未执行，罐、容量与时钟均未改动');
+    }
+    const rawScenarios = input.scenarios as unknown[];
+    if (rawScenarios.length < 1 || rawScenarios.length > 20) {
+      throw new Error(
+        `批量请求审计：场景数必须在 1~20 个之间（当前 ${rawScenarios.length} 个）；整批未执行，罐、容量与时钟均未改动`,
+      );
+    }
+
+    const normalized: Array<{ url: string; options: SendOptions }> = [];
+    rawScenarios.forEach((raw, i) => {
+      const where = `第 ${i + 1} 个场景`;
+      if (!isObject(raw)) {
+        throw new Error(`批量请求审计：${where}必须是对象（含必填字段 url）；整批未执行，罐、容量与时钟均未改动`);
+      }
+      const s = raw as Record<string, unknown>;
+      if (typeof s.url !== 'string' || s.url.trim() === '') {
+        throw new Error(`批量请求审计：${where}缺少请求 URL（字段 url 必须是非空字符串）；整批未执行，罐、容量与时钟均未改动`);
+      }
+      if (hostFromUrl(s.url.trim()) === null) {
+        throw new Error(`批量请求审计：${where}的请求 URL 非法或非 http(s)：${s.url}；整批未执行，罐、容量与时钟均未改动`);
+      }
+      if (s.topUrl !== undefined) {
+        if (typeof s.topUrl !== 'string') {
+          throw new Error(`批量请求审计：${where}的顶层页面 URL（字段 topUrl）必须是字符串；整批未执行，罐、容量与时钟均未改动`);
+        }
+        if (s.topUrl.trim() !== '' && hostFromUrl(s.topUrl.trim()) === null) {
+          throw new Error(`批量请求审计：${where}的顶层页面 URL 非法或非 http(s)：${s.topUrl}；整批未执行，罐、容量与时钟均未改动`);
+        }
+      }
+      if (s.method !== undefined) {
+        if (typeof s.method !== 'string') {
+          throw new Error(`批量请求审计：${where}的请求方法（字段 method）必须是字符串；整批未执行，罐、容量与时钟均未改动`);
+        }
+        if (s.method.trim() === '') {
+          throw new Error(`批量请求审计：${where}的请求方法（字段 method）不能为空白字符串（缺省该字段即按 GET）；整批未执行，罐、容量与时钟均未改动`);
+        }
+      }
+      if (s.topLevelNav !== undefined && typeof s.topLevelNav !== 'boolean') {
+        throw new Error(`批量请求审计：${where}的是否顶层导航（字段 topLevelNav）必须是布尔值；整批未执行，罐、容量与时钟均未改动`);
+      }
+      if (s.blockThirdParty !== undefined && typeof s.blockThirdParty !== 'boolean') {
+        throw new Error(`批量请求审计：${where}的屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值；整批未执行，罐、容量与时钟均未改动`);
+      }
+
+      const blockThirdParty = s.blockThirdParty === true;
+      const topRaw = typeof s.topUrl === 'string' ? s.topUrl.trim() : '';
+      if (blockThirdParty && topRaw === '') {
+        throw new Error(
+          `批量请求审计：${where}开启了屏蔽第三方 Cookie，必须提供有效的顶层页面 URL（字段 topUrl）；整批未执行，罐、容量与时钟均未改动`,
+        );
+      }
+
+      normalized.push({
+        url: s.url.trim(),
+        options: {
+          topUrl: topRaw === '' ? undefined : topRaw,
+          method: typeof s.method === 'string' && s.method.trim() !== '' ? s.method.trim() : undefined,
+          topLevelNav: s.topLevelNav,
+          blockThirdParty,
+        },
+      });
+    });
+
+    // ---- 预校验通过：逐场景纯只读演算（touchAccess=false，不刷新访问时间）----
+    const scenarios: AuditScenarioResult[] = normalized.map((entry, i) => {
+      const r = this.computeSend(entry.url, entry.options, this.clockNow, false);
+      // 入参已预校验，理论上不会失败；防御性断言避免把失败结果静默当作成功
+      if (!r.ok) {
+        throw new Error(`批量请求审计：第 ${i + 1} 个场景演算失败：${r.error ?? '未知错误'}；整批未执行，罐、容量与时钟均未改动`);
+      }
+      const conflicts = this.collectNameConflicts(r.sent);
+      return {
+        scenario: i + 1,
+        requestUrl: r.requestUrl,
+        host: r.host,
+        path: r.path,
+        secureRequest: r.secureRequest,
+        topUrl: r.topUrl,
+        method: r.method,
+        topLevelNav: r.topLevelNav,
+        requestSite: r.requestSite,
+        topSite: r.topSite,
+        sameSiteContext: r.sameSiteContext,
+        blockThirdParty: r.blockThirdParty,
+        partitionKey: r.partitionKey,
+        cookieHeader: r.cookieHeader,
+        sentCount: r.sent.length,
+        excludedCount: r.excluded.length,
+        sent: r.sent,
+        excluded: r.excluded,
+        conflictCount: conflicts.length,
+        conflicts,
+      };
+    });
+
+    return {
+      ok: true,
+      scenarioCount: scenarios.length,
+      scenarios,
+      scenariosWithConflicts: scenarios.filter((s) => s.conflictCount > 0).length,
+      totalConflictCount: scenarios.reduce((sum, s) => sum + s.conflictCount, 0),
+      clock: this.clock(),
+    };
+  }
+
+  /**
+   * 识别单个请求头中的同名条目歧义：
+   * 仅在「已发送」列表中按 name 分组，条目数 ≥ 2 的组构成冲突；
+   * 组内条目保持 Cookie 头内次序（Path 长度降序 / 创建序号升序），
+   * 冲突组按组内第一个条目的头内位置排列。
+   * valuesDiffer 表示同名条目是否存在不同的值；distinctValues 列出全部不同值。
+   * 被排除项不参与（调用方只传 sent）。
+   */
+  private collectNameConflicts(sent: RequestItem[]): CookieNameConflict[] {
+    const groups = new Map<string, CookieConflictItem[]>();
+    sent.forEach((item, idx) => {
+      const group = groups.get(item.name);
+      const conflictItem: CookieConflictItem = {
+        position: idx + 1,
+        index: item.index,
+        cookie: item.cookie,
+        name: item.name,
+        value: item.value,
+        domain: item.domain,
+        hostOnly: item.hostOnly,
+        scope: item.hostOnly ? 'host-only' : `domain（含 *.${item.domain}）`,
+        path: item.path,
+        partitioned: item.partitioned,
+        partitionKey: item.partitionKey,
+      };
+      if (group) {
+        group.push(conflictItem);
+      } else {
+        groups.set(item.name, [conflictItem]);
+      }
+    });
+
+    const conflicts: CookieNameConflict[] = [];
+    for (const [name, items] of groups) {
+      if (items.length < 2) continue;
+      const distinctValues: string[] = [];
+      for (const item of items) {
+        if (!distinctValues.includes(item.value)) distinctValues.push(item.value);
+      }
+      conflicts.push({
+        name,
+        count: items.length,
+        valuesDiffer: distinctValues.length > 1,
+        distinctValues,
+        items,
+      });
+    }
+    return conflicts;
   }
 
   /**

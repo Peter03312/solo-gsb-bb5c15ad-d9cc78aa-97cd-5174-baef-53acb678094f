@@ -58,6 +58,14 @@ URL 顺序写入该跳的 Set-Cookie**。**末跳必须为 200 且无 Location**
 顶层页面 URL** 与导航 / 屏蔽开关。结果展示各跳 URL、方法、Cookie 头、每条 Set-Cookie 的
 写入结果与最终罐。
 
+另有 **🔍 批量请求审计：同名 Cookie 歧义**（左栏面板，对应 `POST /api/audit-requests`）：
+一次提交 **1～20 个请求场景**（请求 URL，可选顶层页面 URL、方法、顶层导航、第三方屏蔽），
+按现有发送规则分别演算每个请求的 `Cookie` 头与**逐项排除原因**；仅把**同一请求中至少两条
+已发送的同名条目**列为冲突，按 **Cookie 头内次序**展示各项的**值、域、路径、分区键**并
+标记**值是否相异**——**被排除项不计入冲突**，冲突也不跨场景累计。整批审计**纯只读**：
+**不刷新最近访问时间、不改动罐/容量、不推进演算时钟**；**任一场景参数无效整批报错且状态
+不变**。
+
 内置 **⏱ 演算时钟（可控时间轴）**：服务启动时把当前真实时间固定为演算时钟起点，
 之后**不随真实时间流动**，只能经界面或 `POST /api/clock/advance` 按**正整数秒**推进
 （非法输入被拒绝且时钟与罐均不变）。网络写入/发送、`document.cookie` 读写、罐快照与
@@ -413,7 +421,41 @@ Partitioned（CHIPS）演算示例（写入时填「顶层页面 URL」，发送
 
 排序后以 `; ` 拼接成 `Cookie` 请求头（RFC 6265 的 cookie 排序要求）。
 
-### 重定向链演算（`POST /api/redirect-chain`）
+### 批量请求审计：同名 Cookie 歧义（`POST /api/audit-requests`）
+
+一次提交 **1～20 个请求场景**（界面第 4 步面板），每个场景包含：
+
+- `url`：**请求 URL（必填，http(s) 绝对地址）**；
+- `topUrl`：可选顶层页面 URL（缺省视为与请求 URL 同站；开启 `blockThirdParty` 时必填且须有效）；
+- `method`：可选请求方法（大小写不敏感，缺省 GET）；
+- `topLevelNav`：可选是否顶层导航（缺省 true）；
+- `blockThirdParty`：可选屏蔽第三方 Cookie（缺省 false）。
+
+服务端对每个场景**按上面「发送」一节完全相同的现有规则**演算：过期 → 分区 → 第三方屏蔽
+→ Domain → Path → Secure → SameSite 逐项筛选，发送项按 Path 长度降序 / 创建序号升序排序，
+返回每个请求的 `cookieHeader`、`sent[]` 与 `excluded[]`（逐项排除原因与 `/api/send` 一致）。
+
+**同名歧义（冲突）判定**：
+
+- 仅在**单个请求内部**统计；冲突**不跨场景累计**；
+- 仅当同一请求中出现 **至少两条「已发送」**的同名（name 大小写精确）条目时才算一组冲突
+  ——典型来源是 host-only 项与 Domain 项、不同 Path 项、普通项与 Partitioned 分区项并存；
+- 每组冲突按 **Cookie 头内次序**给出各条目的 **值（value）、域（domain + host-only/domain
+  作用域）、路径（path）、分区键（partitionKey，未分区为 null）**，以及：
+  - `valuesDiffer`：同名条目是否存在两个及以上不同的值；
+  - `distinctValues`：该名称下出现过的全部不同值（按头内首次出现次序）。
+- **被排除项不计入冲突**（只有真正进入 Cookie 头的已发送项会产生歧义）；同名但一条被
+  排除（如 Path 不命中、Secure/ SameSite / 第三方屏蔽拦截）的场景标记为无冲突。
+
+**纯只读与原子性**：
+
+- 审计以「不刷新访问时间」的模式演算：**不刷新任何条目的最近访问时间**（不影响容量淘汰
+  的 LRA 依据），**不改动罐内容、容量，也不推进演算时钟**；
+- **先对整批做完整预校验**（请求 URL / 顶层 URL 必须是有效 http(s) 地址、方法为非空字符串、
+  `topLevelNav` / `blockThirdParty` 必须是布尔值、开启屏蔽第三方时必须提供有效顶层 URL），
+  **任一场景参数无效整批返回 400，整批不演算且状态不变**。
+
+
 
 把「请求 → 3xx 响应（Location + 若干 Set-Cookie）→ 再请求 → … → 200」整条链一次性
 演算，服务不发起真实请求，全部响应步骤由调用方给定（**1~8 步**）。
@@ -537,6 +579,7 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
 | POST | `/api/clock/advance` | `{ "seconds": 120 }` | 以**正整数秒**推进演算时钟（数字或数字字符串均可）；非法输入（缺省、0、负数、非整数、非数字）返回 400 且**时钟与罐均不变**。推进本身不删除条目，响应附最新 `clock`、`cookies` 与 `capacity`（过期/剩余展示随新时间刷新） |
 | POST | `/api/store` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 顺序写入一条 Set-Cookie；`topUrl` 为顶层页面 URL，仅 `Partitioned` cookie 必需（计算分区键），普通 cookie 可省略。`blockThirdParty=true` 开启屏蔽第三方 Cookie：此时 `topUrl` 必填且须有效，跨站响应拒绝写入/删除普通 Cookie（不改动罐、不触发容量淘汰），Partitioned 分区项不受影响。名称按**大小写精确**识别 `__Secure-`（须 HTTPS 来源 + Secure）与 `__Host-`（还须未声明 Domain 且显式 `Path=/`）前缀；**`Max-Age<=0` 删除也先执行同一校验**，拒绝时 `reason` 逐条说明违反的条件，罐内容、创建序号、演算时钟与容量均不变。响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
 | POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true, "blockThirdParty"?: false }` | 演算 Cookie 头与逐项原因；请求分区键由顶层页面 URL（缺省取请求 URL）计算并以 `partitionKey` 返回，仅键相同的 `Partitioned` 项发送。`blockThirdParty=true` 时 `topUrl` 必填且须有效，跨站请求排除普通 Cookie（不刷新其最近访问时间），分区键匹配的 Partitioned 项仍可发送；响应以 `blockThirdParty` 回显开关状态。**HttpOnly 项照常发送**。发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
+| POST | `/api/audit-requests` | `{ "scenarios": [{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true, "blockThirdParty"?: false }] }` | **批量请求审计（1～20 个场景，纯只读）**：按 `/api/send` 的现有规则分别演算每个请求的 `cookieHeader` / `sent` / `excluded`（逐项排除原因）；仅把**同一请求中至少两条已发送的同名条目**列为冲突（`scenarios[].conflicts[]`），按头内次序给出各项的值 / 域 / 路径 / 分区键，`valuesDiffer` 标记同名值是否相异；**被排除项不计入冲突，冲突不跨场景累计**。**不刷新最近访问时间、不改动罐/容量、不推进时钟**；任一场景参数无效整批返回 400 且状态不变。响应含 `scenarioCount`、`scenariosWithConflicts`、`totalConflictCount`、`clock`（审计基准时间）与 `capacity` |
 | POST | `/api/redirect-chain` | `{ "startUrl": "...", "method"?: "POST", "topUrl": "...", "topLevelNav"?: true, "blockThirdParty"?: false, "steps": [{ "status": 303, "location"?: "/相对或绝对", "setCookies"?: ["a=b; Path=/"] }] }` | **重定向链演算（1~8 步）**：先整链预校验（起始/顶层 URL、每跳 http(s) 目标、状态码与 Location 组合、Set-Cookie 列表类型），失败返回 400 且**罐保持不变**。通过后逐跳执行：每跳先按现有规则生成 Cookie 头（`hops[].send` 同 `/api/send` 的完整逐项结果），再按响应 URL 顺序逐条写入 `setCookies`（`hops[].stores[]` 同 `/api/store` 的动作 / 原因 / 淘汰）。前 N-1 步必须是 301/302/303/307/308 且带 Location（相对值基于当前 URL 解析，结果须 http(s)）；**末步必须 200 且无 Location**。303 之后改 GET（HEAD 保留），301/302 仅 POST 改 GET，307/308 保留方法；`hops[].methodNote` 说明改写；`topUrl` / `topLevelNav` / `blockThirdParty` 整条链沿用。成功响应附最终 `hops`（各跳 URL、方法、Cookie 头、写入结果、跳后罐 `jarAfter`）、全罐 `cookies` 与 `capacity` |
 | POST | `/api/script/read` | `{ "url": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 读取演算（页面 JS 视角）**：按既有 过期/分区/第三方屏蔽/Domain/Path/Secure 顺序筛选，**最后再排除 HttpOnly**；**不应用 SameSite、不刷新最近访问时间、不改动罐**。可读项沿用请求头排序（Path 长度降序、创建序号升序），以 `cookieString`（`; ` 拼接）返回，并在 `readable` / `excluded` 中逐项说明原因；上下文字段同 `/api/send`（页面站、顶层站、`partitionKey`、开关回显） |
 | POST | `/api/script/write` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | **document.cookie 赋值演算**：复用 `/api/store` 的解析、分区身份与容量逻辑，但**拒绝带 HttpOnly 的赋值**，并**拒绝覆盖或以 `Max-Age<=0` 删除同身份（name、domain、path、分区键）且未过期的 HttpOnly 项**（已过期的不在保护之列）；脚本专属拒绝在改动罐前返回，**罐内容、时间戳与容量不变**。**`__Secure-` / `__Host-` 前缀校验与 `/api/store` 完全一致**（HTTPS 来源 + Secure；`__Host-` 还须无 Domain 且显式 `Path=/`；`Max-Age<=0` 删除也先校验）。响应结构同 `/api/store`（`action`/`reason`/`jar`/`eviction`） |
@@ -585,6 +628,30 @@ curl -s -X POST http://localhost:3000/api/send \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://widget.vendor.com/frame",
        "topUrl":"https://embed.example.net/page", "blockThirdParty":true}'
+
+# 批量请求审计：1~20 个场景纯只读演算，逐场景给 Cookie 头/逐项排除原因，
+# conflicts[] 仅列出同一请求中至少两条已发送的同名条目（按头内次序：值/域/路径/分区键），
+# valuesDiffer 标记同名值是否相异；审计不刷新访问时间、不改动罐/容量、不推进时钟
+curl -s -X POST http://localhost:3000/api/audit-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"scenarios":[
+        {"url":"https://www.example.com/app/v2/dashboard","method":"GET"},
+        {"url":"https://www.example.com/app","method":"GET"},
+        {"url":"https://www.example.com/","topUrl":"https://other-site.org/",
+         "method":"GET","topLevelNav":false,"blockThirdParty":false}
+      ]}'
+
+# 审计结果逐场景摘要（conflicts 数 / 头内同名条目 / 值是否相异）
+curl -s -X POST http://localhost:3000/api/audit-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"scenarios":[{"url":"https://www.example.com/"}]}' \
+  | python3 -m json.tool
+
+# 任一场景参数无效（下例第 2 个 URL 非法、开启屏蔽第三方却缺 topUrl 等）-> 400，
+# 整批不演算，罐、容量与时钟均不变
+curl -s -X POST http://localhost:3000/api/audit-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"scenarios":[{"url":"https://www.example.com/"},{"url":"not-a-url"}]}'
 
 # 重定向链：POST /signin -> 303（相对 Location 解析为 /dashboard，方法改 GET）
 # -> 302 跨主机 -> 200；每跳先生成 Cookie 头，再按顺序写入该跳 Set-Cookie

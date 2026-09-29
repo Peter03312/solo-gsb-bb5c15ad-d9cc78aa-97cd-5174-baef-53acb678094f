@@ -1477,6 +1477,200 @@ EXC=$(echo "$R" | python3 -c "import sys,json;print('|'.join(i['detail'] for i i
   && { echo "✅ 链中跨站请求排除既有普通 Cookie（$EXC 节选）"; PASS=$((PASS+1)); } \
   || { echo "❌ 既有普通 Cookie 应被屏蔽：HDR=$HDR EXC=$EXC"; FAIL=$((FAIL+1)); }
 
+echo
+echo "------- 批量请求审计（/api/audit-requests：同名 Cookie 歧义，纯只读） -------"
+
+# reset 保留容量设置，而快照演算式恢复过 example.com 的域级上限；审计前显式清空全部上限，
+# 保证下面的 8 条示例 Cookie 不因容量淘汰丢失
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+# sid：host-only 于 www（#1）与 Domain=example.com（#2）并存，值相异
+post /api/store '{"url":"https://www.example.com/","setCookie":"sid=host-only-value; Path=/; Secure"}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"sid=domain-value; Domain=example.com; Path=/; Secure"}' >/dev/null
+# theme：不同 Path 两条（#3/#4），值相同
+post /api/store '{"url":"https://www.example.com/app","setCookie":"theme=dark; Path=/app; Secure"}' >/dev/null
+post /api/store '{"url":"https://www.example.com/app/v2","setCookie":"theme=dark; Path=/app/v2; Secure"}' >/dev/null
+# pval：不同 Path 两条（#5 根路径 / #6 /app），值相异；请求 / 只命中 #5（#6 被排除，不计冲突）
+post /api/store '{"url":"https://www.example.com/","setCookie":"pval=root; Path=/; Secure"}' >/dev/null
+post /api/store '{"url":"https://www.example.com/app","setCookie":"pval=app; Path=/app; Secure"}' >/dev/null
+# 分区 vs 普通同名：ch 普通项 + ch Partitioned（分区键由 topUrl 决定），值相异
+post /api/store '{"url":"https://www.example.com/","setCookie":"ch=plain; Path=/; Secure; SameSite=None"}' >/dev/null
+post /api/store '{"url":"https://www.example.com/","setCookie":"ch=part; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://www.example.com/"}' >/dev/null
+
+AUDIT='{"scenarios":[
+  {"url":"https://www.example.com/app/v2/dashboard","method":"GET"},
+  {"url":"https://www.example.com/app","method":"GET"},
+  {"url":"http://www.example.com/app","method":"GET"},
+  {"url":"https://www.example.com/","topUrl":"https://other-site.org/","method":"GET","topLevelNav":false}
+]}'
+
+echo "== AU1. 整批成功，逐场景 cookieHeader 与发送项 =="
+R=$(post /api/audit-requests "$AUDIT")
+check "ok" '"ok":true' "$R"
+check "4 个场景" '"scenarioCount":4' "$R"
+check "2 个场景有冲突" '"scenariosWithConflicts":2' "$R"
+check "共 7 组冲突（场景1 四组 + 场景2 三组）" '"totalConflictCount":7' "$R"
+check "回显演算时钟" '"clock"' "$R"
+
+# 场景 1：/app/v2/dashboard 命中全部 8 条；
+# 头内次序：Path 长度降序（/app/v2 → /app → /），等长按创建序号
+S1_HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['scenarios'][0]['cookieHeader'])")
+[ "$S1_HDR" = "theme=dark; theme=dark; pval=app; sid=host-only-value; sid=domain-value; pval=root; ch=plain; ch=part" ] \
+  && { echo "✅ 场景1 Cookie 头正确：$S1_HDR"; PASS=$((PASS+1)); } \
+  || { echo "❌ 场景1 Cookie 头异常：$S1_HDR"; FAIL=$((FAIL+1)); }
+
+echo "== AU2. 场景1 冲突组：theme 值相同，sid/pval/ch 值相异（域/路径/分区键/头内位置） =="
+cat > /tmp/au_check2.py <<'PYEOF'
+import sys, json
+d = json.load(open(sys.argv[1]))
+s1 = d['scenarios'][0]
+groups = {g['name']: g for g in s1['conflicts']}
+ok = True
+def expect(cond, msg):
+    global ok
+    print(("✅ " if cond else "❌ ") + msg); ok = ok and cond
+expect(s1['conflictCount'] == 4, f"场景1 共 4 组冲突（实际 {s1['conflictCount']}）")
+expect(set(groups) == {'theme', 'sid', 'pval', 'ch'}, f"冲突名为 theme/sid/pval/ch（实际 {sorted(groups)}）")
+sid = groups['sid']
+expect(sid['valuesDiffer'] is True, "sid valuesDiffer=true（值相异）")
+expect(sid['distinctValues'] == ['host-only-value', 'domain-value'], "sid distinctValues 按头内次序")
+expect(sid['items'][0]['domain'] == 'www.example.com' and sid['items'][0]['hostOnly'] is True, "sid 头一条 host-only www.example.com")
+expect(sid['items'][1]['domain'] == 'example.com' and sid['items'][1]['hostOnly'] is False, "sid 第二条 domain example.com")
+expect([i['position'] for i in sid['items']] == [4, 5], "sid 头内位置 4、5")
+theme = groups['theme']
+expect(theme['count'] == 2 and theme['valuesDiffer'] is False, "theme 2 条且 valuesDiffer=false（值相同）")
+expect(theme['distinctValues'] == ['dark'], "theme distinctValues 仅 dark")
+expect([i['path'] for i in theme['items']] == ['/app/v2', '/app'], "theme 路径按头内次序 /app/v2、/app")
+expect([i['position'] for i in theme['items']] == [1, 2], "theme 头内位置 1、2")
+pval = groups['pval']
+expect(pval['valuesDiffer'] is True and pval['distinctValues'] == ['app', 'root'], "pval 值相异 app/root，按头内次序")
+expect([i['position'] for i in pval['items']] == [3, 6], "pval 头内位置 3、6（/app 在 / 之前）")
+ch = groups['ch']
+expect(ch['valuesDiffer'] is True and ch['distinctValues'] == ['plain', 'part'], "ch 普通+分区值相异")
+expect(ch['items'][0]['partitioned'] is False and ch['items'][0]['partitionKey'] is None, "ch 头一条为未分区项（partitionKey=null）")
+expect(ch['items'][1]['partitioned'] is True and ch['items'][1]['partitionKey'] == 'https://example.com', "ch 第二条 Partitioned，分区键 https://example.com")
+sys.exit(0 if ok else 1)
+PYEOF
+echo "$R" > /tmp/au_r.json
+python3 /tmp/au_check2.py /tmp/au_r.json
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== AU3. 被排除项不计入冲突：场景2 theme 仅 1 条发送（/app/v2 被 Path 排除）不算冲突；场景3 http 全排除无冲突 =="
+cat > /tmp/au_check3.py <<'PYEOF'
+import sys, json
+d = json.load(open(sys.argv[1]))
+s2, s3 = d['scenarios'][1], d['scenarios'][2]
+ok = True
+def expect(cond, msg):
+    global ok
+    print(("✅ " if cond else "❌ ") + msg); ok = ok and cond
+g2 = {g['name']: g for g in s2['conflicts']}
+expect(s2['conflictCount'] == 3, f"场景2 冲突 3 组 sid/pval/ch（实际 {s2['conflictCount']}）")
+expect(set(g2) == {'sid', 'pval', 'ch'}, f"场景2 冲突名为 sid/pval/ch（实际 {sorted(g2)}）")
+expect('theme' not in g2, "theme 仅 1 条发送（另一条 Path 不命中），不计冲突")
+expect(any(i['name'] == 'theme' and 'Path 不匹配' in i['detail'] for i in s2['excluded']), "场景2 排除明细含 theme 的 Path 不匹配")
+# 场景 3：http 明文，Secure 项全被排除（分区项先按分区隔离）；不构成任何冲突
+expect(s3['conflictCount'] == 0, "场景3（http）全部排除：无冲突")
+expect(s3['sentCount'] == 0 and s3['excludedCount'] == 8, f"场景3 发送 0、排除 8（实际 sent={s3['sentCount']} excl={s3['excludedCount']}）")
+expect('Secure cookie 仅经 https 发送' in ' '.join(i['detail'] for i in s3['excluded']), "场景3 排除原因含 Secure 说明")
+sys.exit(0 if ok else 1)
+PYEOF
+python3 /tmp/au_check3.py /tmp/au_r.json
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== AU4. 场景4 跨站非顶层导航：默认 Lax 全排除；普通 ch=None 发送、Partitioned ch 跨分区排除，均不构成冲突 =="
+cat > /tmp/au_check4.py <<'PYEOF'
+import sys, json
+d = json.load(open(sys.argv[1]))
+s4 = d['scenarios'][3]
+sent_names = [i['name'] for i in s4['sent']]
+ok = s4['sameSiteContext'] is False and sent_names == ['ch'] \
+     and s4['sent'][0]['partitioned'] is False and s4['conflictCount'] == 0 \
+     and any('Partitioned' in i['detail'] for i in s4['excluded'])
+print(("✅ " if ok else "❌ ") + f"场景4 仅普通 ch=None 发送（{sent_names}），分区 ch 跨分区排除，无冲突")
+sys.exit(0 if ok else 1)
+PYEOF
+python3 /tmp/au_check4.py /tmp/au_r.json
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== AU5. Partitioned 与普通同名项：分区键匹配时两条同发 -> 值相异冲突 =="
+R2=$(post /api/audit-requests '{"scenarios":[{"url":"https://www.example.com/","topUrl":"https://www.example.com/","method":"GET"}]}')
+cat > /tmp/au_check5.py <<'PYEOF'
+import sys, json
+d = json.load(open(sys.argv[1]))
+s = d['scenarios'][0]
+g = {x['name']: x for x in s['conflicts']}.get('ch')
+items = g['items'] if g else []
+ok = g is not None and g['count'] == 2 and g['valuesDiffer'] is True \
+     and {i['partitionKey'] for i in items} == {'https://example.com', None} \
+     and items[0]['partitioned'] is False and items[0]['partitionKey'] is None \
+     and items[1]['partitioned'] is True and items[1]['partitionKey'] == 'https://example.com'
+print(("✅ " if ok else "❌ ") + "普通项 + Partitioned 同名项在分区键匹配时同发，标记值相异且展示分区键")
+sys.exit(0 if ok else 1)
+PYEOF
+echo "$R2" > /tmp/au_r2.json
+python3 /tmp/au_check5.py /tmp/au_r2.json
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== AU6. 分区键不同（跨站非顶层导航）：Partitioned 项被排除，普通 ch=None 单独发送不构成冲突 =="
+R3=$(post /api/audit-requests '{"scenarios":[{"url":"https://www.example.com/","topUrl":"https://other-site.org/","method":"GET","topLevelNav":false}]}')
+cat > /tmp/au_check6.py <<'PYEOF'
+import sys, json
+d = json.load(open(sys.argv[1]))
+s = d['scenarios'][0]
+names_sent = [i['name'] for i in s['sent']]
+ok = s['conflictCount'] == 0 and names_sent == ['ch'] \
+     and s['sent'][0]['partitioned'] is False \
+     and any('Partitioned' in i['detail'] for i in s['excluded'])
+print(("✅ " if ok else "❌ ") + f"跨分区：ch 仅普通项发送（sent={names_sent}），分区项排除明细含 Partitioned，无冲突")
+sys.exit(0 if ok else 1)
+PYEOF
+echo "$R3" > /tmp/au_r3.json
+python3 /tmp/au_check6.py /tmp/au_r3.json
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== AU7. 审计纯只读：连续审计不刷新最近访问时间、不改罐/时钟 =="
+BEFORE=$(curl -s "$BASE/api/jar")
+CLOCK_BEFORE=$(curl -s "$BASE/api/clock")
+for _ in 1 2 3; do post /api/audit-requests "$AUDIT" >/dev/null; done
+AFTER=$(curl -s "$BASE/api/jar")
+CLOCK_AFTER=$(curl -s "$BASE/api/clock")
+[ "$BEFORE" = "$AFTER" ] && [ "$CLOCK_BEFORE" = "$CLOCK_AFTER" ] \
+  && { echo "✅ 3 次审计后罐（含最近访问时间）与时钟完全不变"; PASS=$((PASS+1)); } \
+  || { echo "❌ 审计不是纯只读"; FAIL=$((FAIL+1)); }
+
+echo "== AU8. 整批参数校验：任一无效 -> 400 且整批不执行、状态不变 =="
+audit_expect_400() { # desc body
+  local code
+  code=$(curl -s -o /tmp/au_resp.json -w '%{http_code}' -X POST "$BASE/api/audit-requests" \
+    -H 'Content-Type: application/json' -d "$2")
+  if [ "$code" = "400" ] && grep -q '"ok":false' /tmp/au_resp.json && grep -q '整批' /tmp/au_resp.json; then
+    echo "✅ $1 -> 400"; PASS=$((PASS+1));
+  else echo "❌ $1 应 400，实际 $code：$(cat /tmp/au_resp.json)"; FAIL=$((FAIL+1)); fi
+}
+audit_expect_400 "scenarios 缺失" '{}'
+audit_expect_400 "空数组" '{"scenarios":[]}'
+audit_expect_400 "21 个场景超上限" "$(python3 -c "import json;print(json.dumps({'scenarios':[{'url':'https://a.com/'}]*21}))")"
+audit_expect_400 "场景缺 url" '{"scenarios":[{"method":"GET"}]}'
+audit_expect_400 "请求 URL 非法" '{"scenarios":[{"url":"not-a-url"}]}'
+audit_expect_400 "非 http(s) URL" '{"scenarios":[{"url":"ftp://a.com/"}]}'
+audit_expect_400 "topUrl 非法" '{"scenarios":[{"url":"https://a.com/","topUrl":"nope"}]}'
+audit_expect_400 "method 空白" '{"scenarios":[{"url":"https://a.com/","method":"  "}]}'
+audit_expect_400 "topLevelNav 非布尔" '{"scenarios":[{"url":"https://a.com/","topLevelNav":"yes"}]}'
+audit_expect_400 "屏蔽第三方缺 topUrl" '{"scenarios":[{"url":"https://a.com/","blockThirdParty":true}]}'
+audit_expect_400 "第 2 个场景非法（整批失败）" '{"scenarios":[{"url":"https://a.com/"},{"url":"bad"}]}'
+AFTER2=$(curl -s "$BASE/api/jar")
+[ "$BEFORE" = "$AFTER2" ] && { echo "✅ 全部非法批次后罐与时钟保持不变"; PASS=$((PASS+1)); } \
+  || { echo "❌ 非法批次改动了状态"; FAIL=$((FAIL+1)); }
+
+echo "== AU9. 边界：1 个与 20 个场景均成功 =="
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/audit-requests" -H 'Content-Type: application/json' \
+  -d '{"scenarios":[{"url":"https://www.example.com/"}]}')
+[ "$code" = "200" ] && { echo "✅ 1 个场景 -> 200"; PASS=$((PASS+1)); } || { echo "❌ 1 个场景应 200，实际 $code"; FAIL=$((FAIL+1)); }
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/audit-requests" -H 'Content-Type: application/json' \
+  -d "$(python3 -c "import json;print(json.dumps({'scenarios':[{'url':'https://www.example.com/'}]*20}))")")
+[ "$code" = "200" ] && { echo "✅ 20 个场景 -> 200"; PASS=$((PASS+1)); } || { echo "❌ 20 个场景应 200，实际 $code"; FAIL=$((FAIL+1)); }
+
 post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 

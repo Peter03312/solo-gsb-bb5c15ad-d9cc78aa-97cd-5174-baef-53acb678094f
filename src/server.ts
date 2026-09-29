@@ -15,6 +15,13 @@
  *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
+ *   POST /api/audit-requests     { scenarios: [{ url, topUrl?, method?, topLevelNav?, blockThirdParty? }] }
+ *                                批量请求审计（1~20 个场景，纯只读）：按现有发送规则分别演算每个
+ *                                请求的 Cookie 头与逐项排除原因；仅把同一请求中至少两条「已发送」
+ *                                的同名条目列为冲突，按头内次序展示各项的值、域、路径、分区键，
+ *                                并标记同名值是否相异（被排除项不计入冲突，冲突不跨场景累计）。
+ *                                不刷新最近访问时间，不改动罐、容量，也不推进演算时钟；
+ *                                任一场景参数无效整批返回 400 且状态不变。
  *   POST /api/redirect-chain     { startUrl, method?, topUrl, topLevelNav?, blockThirdParty?,
  *                                  steps: [{ status, location?, setCookies?[] }] }（最多 8 步）
  *                                演算整条重定向链：每跳先按现有规则生成 Cookie 头，再按响应 URL
@@ -55,6 +62,7 @@
 import express from 'express';
 import path from 'path';
 import { CookieJar } from './cookieJar';
+import type { AuditRequestInput } from './cookieJar';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -157,6 +165,48 @@ app.post('/api/send', (req, res) => {
   });
   // 发送成功的条目会刷新最近访问时间，故把最新罐内容与用量一并返回
   res.json({ ...result, capacity: jar.capacity(), cookies: jar.list() });
+});
+
+interface AuditScenariosBody {
+  scenarios?: unknown;
+}
+
+app.post('/api/audit-requests', (req, res) => {
+  const { scenarios } = (req.body ?? {}) as AuditScenariosBody;
+  // 结构预校验在 server 层；逐场景语义校验（URL/方法/布尔字段/屏蔽第三方必须带有效顶层 URL）
+  // 在罐内整批完成：任一失败抛错 -> 400，整批不演算、罐内容、容量与时钟均不变。
+  // 纯只读：不刷新最近访问时间，故不回写 cookies（仍附 capacity 与结果内 clock 供界面展示）。
+  if (!Array.isArray(scenarios)) {
+    res.status(400).json({
+      ok: false,
+      error: '批量请求审计：请求体必须是 { "scenarios": [...] }（scenarios 为 1~20 个场景的数组）；整批未执行，罐、容量与时钟均未改动',
+    });
+    return;
+  }
+  if (scenarios.length < 1 || scenarios.length > 20) {
+    res.status(400).json({
+      ok: false,
+      error: `批量请求审计：场景数必须在 1~20 个之间（当前 ${scenarios.length} 个）；整批未执行，罐、容量与时钟均未改动`,
+    });
+    return;
+  }
+  for (let i = 0; i < scenarios.length; i += 1) {
+    const raw = scenarios[i] as unknown;
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      res.status(400).json({
+        ok: false,
+        error: `批量请求审计：第 ${i + 1} 个场景必须是对象（含必填字段 url）；整批未执行，罐、容量与时钟均未改动`,
+      });
+      return;
+    }
+  }
+  try {
+    // 罐内逐场景做完整语义校验（含 URL 有效性、方法非空、布尔字段、屏蔽第三方须带有效 topUrl）
+    const result = jar.auditRequests({ scenarios: scenarios as AuditRequestInput[] });
+    res.json({ ...result, capacity: jar.capacity() });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 interface RedirectChainBody {
