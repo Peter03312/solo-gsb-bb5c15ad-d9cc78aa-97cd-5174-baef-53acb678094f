@@ -1481,6 +1481,162 @@ post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
 echo
+echo "------- 批量发送审计：同名 Cookie 头歧义（POST /api/audit/sends，纯只读） -------"
+
+# 构造同名条目：
+#  sid#1 host-only 于 a.example.com /
+#  sid#2 Domain=example.com /
+#  sid#3 Domain=example.com /app（不同 Path 身份，可并存）
+#  eq#4 host-only 于 a.example.com /；eq#5 Domain=example.com /（同名且同值）
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://a.example.com/","setCookie":"sid=hostA; Path=/; Max-Age=3600"}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"sid=domE; Domain=example.com; Path=/; Max-Age=3600"}' >/dev/null
+post /api/store '{"url":"https://example.com/app","setCookie":"sid=domApp; Domain=example.com; Path=/app; Max-Age=3600"}' >/dev/null
+post /api/store '{"url":"https://a.example.com/","setCookie":"eq=same; Path=/; Max-Age=3600"}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"eq=same; Domain=example.com; Path=/; Max-Age=3600"}' >/dev/null
+# 一个会因 Path 不匹配被排除的同名项，验证「被排除项不计入冲突」
+post /api/store '{"url":"https://a.example.com/deep","setCookie":"only=solo; Path=/deep; Max-Age=3600"}' >/dev/null
+
+# 推进时钟：若审计错误地刷新了 lastAccessedAt，本推进后可被察觉
+adv 60
+JAR_BEFORE=$(curl -s "$BASE/api/jar")
+
+echo "== AU1. 多场景审计：冲突识别、头内次序、valuesDiffer =="
+R=$(post /api/audit/sends '{"scenarios":[
+  {"url":"https://a.example.com/app/x"},
+  {"url":"https://a.example.com/"},
+  {"url":"https://other.example.org/"},
+  {"url":"https://a.example.com/deep/x"}]}')
+check "审计成功" '"ok":true' "$R"
+check "场景总数 4" '"scenarioCount":4' "$R"
+check "冲突场景数 3" '"conflictScenarioCount":3' "$R"
+check "冲突组总数 6（场景1 sid+eq、场景2 sid+eq、场景4 sid+eq）" '"conflictCount":6' "$R"
+
+AU_R="$R" python3 - <<'PY'
+import os, sys, json
+d = json.loads(os.environ["AU_R"])
+rs = d["results"]
+fails = []
+
+# 场景 1：/app/x -> sid 三条（/app 路径最长居首，随后 host-only，再 domain /），eq 两条
+r1 = rs[0]
+h1 = r1["send"]["cookieHeader"]
+if h1 != "sid=domApp; sid=hostA; sid=domE; eq=same; eq=same":
+    fails.append(f"场景1 Cookie 头异常: {h1}")
+c = {g["name"]: g for g in r1["conflicts"]}
+if set(c) != {"sid", "eq"}:
+    fails.append(f"场景1 冲突组异常: {list(c)}")
+g = c["sid"]
+if g["count"] != 3 or not g["valuesDiffer"]:
+    fails.append(f"场景1 sid 组 count/valuesDiffer 异常: {g['count']},{g['valuesDiffer']}")
+if [it["value"] for it in g["items"]] != ["domApp", "hostA", "domE"]:
+    fails.append("场景1 sid 组次序非头内次序")
+if [it["position"] for it in g["items"]] != [0, 1, 2]:
+    fails.append(f"场景1 sid 组 position 异常: {[it['position'] for it in g['items']]}")
+t = g["items"][1]
+if (t["domain"], t["hostOnly"], t["path"], t["partitionKey"]) != ("a.example.com", True, "/", None):
+    fails.append(f"场景1 sid host 项字段异常: {t}")
+ge = c["eq"]
+if ge["count"] != 2 or ge["valuesDiffer"]:
+    fails.append(f"场景1 eq 组（值相同也应冲突）异常: {ge['count']},{ge['valuesDiffer']}")
+
+# 场景 2：/ -> 只有 host-only sid 与 domain sid（/app 项被 Path 排除），冲突=2
+r2 = rs[1]
+if r2["send"]["cookieHeader"] != "sid=hostA; sid=domE; eq=same; eq=same":
+    fails.append(f"场景2 Cookie 头异常: {r2['send']['cookieHeader']}")
+if [g["name"] for g in r2["conflicts"]] != ["sid", "eq"]:
+    fails.append("场景2 冲突组异常")
+if r2["conflicts"][0]["count"] != 2:
+    fails.append("场景2 sid 应 2 条")
+
+# 场景 3：无关域 -> 全排除，无冲突
+r3 = rs[2]
+if r3["send"]["cookieHeader"] != "" or r3["hasConflict"] or not all(
+        i["verdict"] == "exclude" for i in r3["send"]["excluded"]):
+    fails.append("场景3 应无发送、无冲突")
+
+# 场景 4：/deep/x -> only=solo 发送；sid#3(/app) 与 Path / 不匹配的项被排除，
+# 但 sid host-only + domain 仍两条同名发送 -> sid 冲突；only 仅一条不冲突
+r4 = rs[3]
+sent_names = [i["name"] for i in r4["send"]["sent"]]
+if "only" not in sent_names:
+    fails.append("场景4 only=solo 应发送")
+if any(g["name"] == "only" for g in r4["conflicts"]):
+    fails.append("场景4 only 单条不应成冲突")
+if not any(g["name"] == "sid" and g["count"] == 2 for g in r4["conflicts"]):
+    fails.append("场景4 sid 应有 2 条冲突（/app 项被排除）")
+
+if fails:
+    for f in fails: print("FAIL:", f)
+    sys.exit(1)
+print("✅ 冲突口径/头内次序/valuesDiffer/排除不计入 全部正确")
+PY
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== AU2. 整批纯只读：审计后罐与最近访问时间不变（/api/send 仍会刷新） =="
+JAR_AFTER=$(curl -s "$BASE/api/jar")
+[ "$JAR_BEFORE" = "$JAR_AFTER" ] && { echo "✅ 审计未刷新最近访问时间、未改动罐"; PASS=$((PASS+1)); } \
+  || { echo "❌ 审计改动了罐（含最近访问时间）"; FAIL=$((FAIL+1)); }
+
+# 审计后再 /api/send，最近访问时间应被刷新（行为不变）
+post /api/send '{"url":"https://a.example.com/app/x"}' >/dev/null
+JAR_SEND=$(curl -s "$BASE/api/jar")
+[ "$JAR_BEFORE" != "$JAR_SEND" ] && { echo "✅ /api/send 仍刷新最近访问时间（既有行为不变）"; PASS=$((PASS+1)); } \
+  || { echo "❌ /api/send 刷新行为被破坏"; FAIL=$((FAIL+1)); }
+
+echo "== AU3. 分区项参与同名冲突：未分区项与分区键匹配的 Partitioned 同名项同头发送 =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://w.example/","setCookie":"p=plain; Path=/; Secure; SameSite=None; Max-Age=3600"}' >/dev/null
+post /api/store '{"url":"https://w.example/","setCookie":"p=part; Path=/; Secure; SameSite=None; Partitioned; Max-Age=3600","topUrl":"https://top.example/"}' >/dev/null
+R=$(post /api/audit/sends '{"scenarios":[{"url":"https://w.example/","topUrl":"https://top.example/"}]}')
+echo "$R" | python3 -c "
+import sys,json
+r=json.load(sys.stdin)['results'][0]
+g=r['conflicts'][0]
+keys=[i['partitionKey'] for i in g['items']]
+assert g['name']=='p' and g['count']==2 and g['valuesDiffer'], g
+assert keys==[None,'https://top.example'], keys
+print('✅ 普通项 + Partitioned 同名同头发送，分区键逐项展示：', keys)
+" && PASS=$((PASS+1)) || { echo "❌ 分区同名冲突识别异常"; FAIL=$((FAIL+1)); }
+
+echo "== AU4. 任一场景无效 -> 整批 400 且罐状态不变 =="
+audit_expect_400() { # desc body
+  local code
+  code=$(curl -s -o /tmp/au_resp.json -w '%{http_code}' -X POST "$BASE/api/audit/sends" \
+    -H 'Content-Type: application/json' -d "$2")
+  if [ "$code" = "400" ] && grep -q '"ok":false' /tmp/au_resp.json && grep -q '均不变' /tmp/au_resp.json; then
+    echo "✅ $1 -> 400"; PASS=$((PASS+1));
+  else echo "❌ $1 应 400，实际 $code：$(cat /tmp/au_resp.json)"; FAIL=$((FAIL+1)); fi
+}
+SNAP_BEFORE=$(curl -s "$BASE/api/jar")
+audit_expect_400 "缺少 scenarios" '{}'
+audit_expect_400 "空场景数组" '{"scenarios":[]}'
+audit_expect_400 "21 个场景超限" "$(python3 -c "import json;print(json.dumps({'scenarios':[{'url':'https://a.example.com/'}]*21}))")"
+audit_expect_400 "场景非对象" '{"scenarios":["x"]}'
+audit_expect_400 "缺 url" '{"scenarios":[{}]}'
+audit_expect_400 "url 非字符串" '{"scenarios":[{"url":5}]}'
+audit_expect_400 "url 非法" '{"scenarios":[{"url":"https://a.example.com/"},{"url":"not-a-url"}]}'
+audit_expect_400 "topUrl 非法" '{"scenarios":[{"url":"https://a.example.com/","topUrl":"bad"}]}'
+audit_expect_400 "method 类型错" '{"scenarios":[{"url":"https://a.example.com/","method":5}]}'
+audit_expect_400 "topLevelNav 类型错" '{"scenarios":[{"url":"https://a.example.com/","topLevelNav":"yes"}]}'
+audit_expect_400 "blockThirdParty 类型错" '{"scenarios":[{"url":"https://a.example.com/","blockThirdParty":1}]}'
+audit_expect_400 "开屏蔽却缺 topUrl" '{"scenarios":[{"url":"https://a.example.com/","blockThirdParty":true}]}'
+# 第 1 个场景合法、第 2 个非法：仍整批拒绝
+audit_expect_400 "合法+非法混合" '{"scenarios":[{"url":"https://a.example.com/"},{"url":""}]}'
+SNAP_AFTER=$(curl -s "$BASE/api/jar")
+[ "$SNAP_BEFORE" = "$SNAP_AFTER" ] && { echo "✅ 全部非法批次后罐状态不变"; PASS=$((PASS+1)); } \
+  || { echo "❌ 非法批次改动了罐"; FAIL=$((FAIL+1)); }
+
+echo "== AU5. 审计结果附 capacity 用量，但不附全罐 cookies（只读不回写） =="
+R=$(post /api/audit/sends '{"scenarios":[{"url":"https://w.example/"}]}')
+echo "$R" | grep -q '"capacity"' && ! echo "$R" | grep -q '"cookies"' \
+  && { echo "✅ 响应含 capacity、不含 cookies"; PASS=$((PASS+1)); } \
+  || { echo "❌ 审计响应字段异常：$R" | head -c 300; echo; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

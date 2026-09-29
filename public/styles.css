@@ -524,6 +524,92 @@ select:focus {
 .chain-hop-body .header-block { margin: 8px 0; }
 .chain-hop-body .eviction-box { margin-top: 8px; }
 
+/* ---------- 批量请求审计（同名 Cookie 头歧义） ---------- */
+.audit-scenarios { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.audit-scenario {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(154,163,181,.05);
+}
+.audit-scenario-head { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
+.audit-scenario-head input[type="text"] { padding: 7px 9px; font-size: 12px; flex: 1 1 0; min-width: 0; }
+.audit-scenario-no { font-weight: 600; font-size: 13px; flex-shrink: 0; color: var(--text-dim); }
+.audit-scenario-opts {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.audit-scenario-opts .audit-top-url { flex: 1 1 200px; min-width: 140px; }
+.audit-scenario-opts select { flex: 0 0 90px; }
+.audit-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.audit-check input[type="checkbox"] { margin: 0; }
+
+.audit-results { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.audit-scenario-result {
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: rgba(154,163,181,.04);
+  overflow: hidden;
+}
+.audit-scenario-result.has-conflict { border-color: rgba(240,160,32,.45); }
+.audit-scenario-summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  list-style: none;
+}
+.audit-scenario-summary::-webkit-details-marker { display: none; }
+.audit-scenario-summary::before { content: '▸'; color: var(--text-faint); font-size: 11px; }
+.audit-scenario-result[open] .audit-scenario-summary::before { content: '▾'; }
+.audit-scenario-url { font-size: 12px; word-break: break-all; }
+.audit-scenario-body { padding: 4px 12px 12px; border-top: 1px solid var(--card-border); }
+.audit-scenario-body .header-block { margin: 8px 0; }
+
+.conflict-banner {
+  margin: 8px 0;
+  font-size: 12.5px;
+  color: #f3c168;
+  background: var(--amber-bg);
+  border: 1px solid rgba(240,160,32,.25);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+.no-conflict { font-size: 12.5px; margin: 8px 0; }
+.conflict-list { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.conflict-group {
+  border: 1px solid rgba(240,160,32,.3);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(240,160,32,.06);
+}
+.conflict-group-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.tag.conflict-name { background: var(--amber-bg); color: #f3c168; }
+.tag.conflict-diff { background: var(--red-bg); color: var(--red); }
+.tag.conflict-same { background: var(--green-bg); color: var(--green); }
+.conflict-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.conflict-table th {
+  text-align: left;
+  color: var(--text-faint);
+  font-weight: 500;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--card-border);
+}
+.conflict-table td { padding: 4px 8px; border-bottom: 1px solid rgba(42,47,62,.6); vertical-align: top; }
+.conflict-table tr:last-child td { border-bottom: none; }
+
 /* ---------- 底部规则 ---------- */
 .rules-note {
   padding-bottom: 40px;

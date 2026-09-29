@@ -15,6 +15,12 @@
  *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
+ *   POST /api/audit/sends        { scenarios: [{ url, topUrl?, method?, topLevelNav?, blockThirdParty? }] }
+ *                                （1~20 个场景）批量发送审计：按现有发送规则分别演算每个场景的
+ *                                Cookie 头与逐项排除原因，并识别同名歧义——仅同一请求中至少两条
+ *                                「已发送」的同名条目列为冲突，按头内次序给出值/域/路径/分区键并标记
+ *                                值是否相异；被排除项不计入冲突。整批纯只读：不刷新最近访问时间，
+ *                                不改动罐、容量或演算时钟；任一场景参数无效整批 400 且状态不变。
  *   POST /api/redirect-chain     { startUrl, method?, topUrl, topLevelNav?, blockThirdParty?,
  *                                  steps: [{ status, location?, setCookies?[] }] }（最多 8 步）
  *                                演算整条重定向链：每跳先按现有规则生成 Cookie 头，再按响应 URL
@@ -55,6 +61,7 @@
 import express from 'express';
 import path from 'path';
 import { CookieJar } from './cookieJar';
+import type { AuditScenarioInput } from './cookieJar';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -157,6 +164,81 @@ app.post('/api/send', (req, res) => {
   });
   // 发送成功的条目会刷新最近访问时间，故把最新罐内容与用量一并返回
   res.json({ ...result, capacity: jar.capacity(), cookies: jar.list() });
+});
+
+interface AuditSendsBody {
+  scenarios?: unknown;
+}
+
+interface RawAuditScenario {
+  url?: unknown;
+  topUrl?: unknown;
+  method?: unknown;
+  topLevelNav?: unknown;
+  blockThirdParty?: unknown;
+}
+
+app.post('/api/audit/sends', (req, res) => {
+  const { scenarios } = (req.body ?? {}) as AuditSendsBody;
+
+  // ---- 结构层预校验（类型/数量）；语义层（URL、第三方屏蔽的 topUrl）在罐内再完整预校验 ----
+  if (!Array.isArray(scenarios)) {
+    res.status(400).json({ ok: false, error: '缺少请求场景数组（字段 scenarios，1~20 个）；审计已取消，罐、容量与演算时钟均不变' });
+    return;
+  }
+  if (scenarios.length < 1 || scenarios.length > 20) {
+    res.status(400).json({
+      ok: false,
+      error: `请求场景数量必须为 1~20 个（当前 ${scenarios.length} 个）；审计已取消，罐、容量与演算时钟均不变`,
+    });
+    return;
+  }
+
+  const inputs: AuditScenarioInput[] = [];
+  for (let i = 0; i < scenarios.length; i += 1) {
+    const raw = scenarios[i] as Partial<RawAuditScenario> | null;
+    const where = `第 ${i + 1} 个请求场景`;
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      res.status(400).json({ ok: false, error: `${where}必须是对象；审计已取消，罐、容量与演算时钟均不变` });
+      return;
+    }
+    if (typeof raw.url !== 'string' || raw.url.trim() === '') {
+      res.status(400).json({ ok: false, error: `${where}缺少请求 URL（字段 url）；审计已取消，罐、容量与演算时钟均不变` });
+      return;
+    }
+    if (raw.topUrl !== undefined && typeof raw.topUrl !== 'string') {
+      res.status(400).json({ ok: false, error: `${where}的顶层页面 URL（字段 topUrl）必须是字符串；审计已取消，罐、容量与演算时钟均不变` });
+      return;
+    }
+    if (raw.method !== undefined && typeof raw.method !== 'string') {
+      res.status(400).json({ ok: false, error: `${where}的请求方法（字段 method）必须是字符串；审计已取消，罐、容量与演算时钟均不变` });
+      return;
+    }
+    if (raw.topLevelNav !== undefined && typeof raw.topLevelNav !== 'boolean') {
+      res.status(400).json({ ok: false, error: `${where}的是否顶层导航（字段 topLevelNav）必须是布尔值；审计已取消，罐、容量与演算时钟均不变` });
+      return;
+    }
+    if (raw.blockThirdParty !== undefined && typeof raw.blockThirdParty !== 'boolean') {
+      res.status(400).json({ ok: false, error: `${where}的屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值；审计已取消，罐、容量与演算时钟均不变` });
+      return;
+    }
+    inputs.push({
+      url: raw.url.trim(),
+      topUrl: typeof raw.topUrl === 'string' && raw.topUrl.trim() !== '' ? raw.topUrl.trim() : undefined,
+      method: typeof raw.method === 'string' && raw.method.trim() !== '' ? raw.method.trim() : undefined,
+      topLevelNav: raw.topLevelNav,
+      blockThirdParty: raw.blockThirdParty === true,
+    });
+  }
+
+  // 罐内先完整预校验（URL http(s)、blockThirdParty 需 topUrl），再统一纯只读演算：
+  // 不刷新最近访问时间、不改动罐/容量/时钟；任一场景无效抛错 -> 400 且状态不变。
+  try {
+    const result = jar.auditSends(inputs);
+    res.json({ ...result, capacity: jar.capacity() });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 interface RedirectChainBody {
